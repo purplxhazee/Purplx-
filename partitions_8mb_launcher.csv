@@ -1,0 +1,48 @@
+# =============================================================================
+# partitions_8mb_launcher.csv — Purplx + SD Firmware Launcher
+# Target: M5Stack Cardputer ADV, ESP32-S3, 8MB Flash (0x800000)
+#
+# Architecture:
+#   factory   — Purplx permanent home. Flashed via serial (pio upload → 0x10000).
+#               Cannot be overwritten by OTA — acts as an indestructible fallback.
+#   ota_0     — Guest firmware slot. SDLauncher streams .bin files here.
+#               Marked PENDING_VERIFY on boot; if guest never calls mark_valid(),
+#               the bootloader automatically rolls back to factory on next reset.
+#   storage   — Internal FAT filesystem (music, notes, saves, config).
+#
+# Rollback mechanism (requires CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y):
+#   1. SDLauncher flashes guest.bin → ota_0 (state: ESP_OTA_IMG_NEW)
+#   2. esp_ota_set_boot_partition(ota_0) — does NOT confirm
+#   3. esp_restart() → bootloader sets ota_0 state to PENDING_VERIFY, boots it
+#   4. Guest app runs. It does not know about Purplx, never calls mark_valid()
+#   5. User presses physical RESET
+#   6. Bootloader sees ota_0 = PENDING_VERIFY (unconfirmed) → marks ABORTED
+#   7. No valid OTA slot → bootloader falls back to factory partition (Purplx) ✓
+#
+# Purplx serial flash always writes to 0x10000 = factory start. ✓
+# "pio run --target upload" naturally updates Purplx in factory. ✓
+# Guest firmware cannot overwrite factory — safe by design. ✓
+#
+# Size breakdown (8MB = 0x800000):
+#   nvs      20KB    key-value store (themes, preferences)
+#   otadata   8KB    OTA slot selector (bootloader reads this)
+#   factory   1.5MB  Purplx — ~220KB headroom from current ~1.28MB build
+#   ota_0     5.4MB  Guest slot — fits Bruce, Ghost ESP, Marauder, large firmwares
+#   storage   1.0MB  Internal FAT (music, saves, notes)
+#
+# Offset arithmetic:
+#   factory end : 0x010000 + 0x180000 = 0x190000
+#   ota_0 end   : 0x190000 + 0x570000 = 0x700000
+#   storage end : 0x700000 + 0x100000 = 0x800000 ✓
+#
+# IMPORTANT: partition layout changed — MUST erase chip before flashing:
+#   pio run --target erase && pio run --target upload
+# (subsequent uploads to factory do not need --target erase)
+# =============================================================================
+
+# Name,     Type,  SubType,  Offset,    Size,    Flags
+nvs,        data,  nvs,      0x9000,    0x5000,
+otadata,    data,  ota,      0xe000,    0x2000,
+factory,    app,   factory,  0x10000,   0x180000,
+ota_0,      app,   ota_0,    0x190000,  0x570000,
+storage,    data,  fat,      0x700000,  0x100000,

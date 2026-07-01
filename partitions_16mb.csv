@@ -1,0 +1,27 @@
+# =============================================================================
+# partitions_16mb.csv — MegaFirmware Custom Partition Table
+# Target: ESP32-S3, 16MB Flash (0x1000000 bytes)
+#
+# Compared to M5PorkChop (8MB flash, 3MB+3MB+1.5MB+64KB):
+# We have 2x the flash → each app partition is 6.375MB vs their 3MB.
+# This headroom is why we can build a monolith at all.
+#
+# Layout (all offsets 4KB-aligned):
+#   [Bootloader]  0x000000 – 0x008FFF  36KB  (not in table, managed by IDF)
+#   [nvs]         0x009000 – 0x00DFFF  20KB  NVS key-value store
+#   [otadata]     0x00E000 – 0x00FFFF   8KB  OTA slot selector
+#   [app0]        0x010000 – 0x66FFFF   6.375MB  Active firmware
+#   [app1]        0x670000 – 0xCCFFFF   6.375MB  OTA firmware slot
+#   [coredump]    0xCD0000 – 0xCDFFFF  64KB  ESP-IDF crash dumps (ELF format)
+#   [fatfs]       0xCE0000 – 0xFFFFFF   3.125MB  Internal FAT (config, XP backup)
+#
+# Verify fit: 0xCE0000 + 0x320000 = 0x1000000 ✓
+# =============================================================================
+
+# Name,     Type, SubType,  Offset,    Size,
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x660000,
+app1,       app,  ota_1,    0x670000,  0x660000,
+coredump,   data, coredump, 0xCD0000,  0x10000,
+fatfs,      data, fat,      0xCE0000,  0x320000,

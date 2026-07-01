@@ -1,0 +1,883 @@
+// =============================================================================
+// main.cpp — Purplx (pure cyberdeck)
+// Boot "Purplx" splash -> categorized home launcher -> built-in apps.
+// =============================================================================
+
+#include "../include/main.h"
+#include "../include/themes.h"
+#include "core/display.h"
+#include "core/radio_manager.h"
+#include "ui/cyberfx.h"
+
+// Apps
+#include "apps/csi/csi.h"
+#include "apps/games/snake.h"
+#include "apps/games/tetris.h"
+#include "apps/games/wordle.h"
+#include "apps/games/chess.h"
+#include "apps/games/checkers.h"
+#include "apps/games/tron.h"
+#include "apps/games/pong.h"
+#include "apps/games/game2048.h"
+#include "apps/games/life.h"
+#include "apps/offgrid/survival.h"
+#include "apps/offgrid/morse.h"
+#include "apps/offgrid/sos.h"
+#include "apps/edc/edc_tools.h"
+#include "apps/media/wav_player.h"
+#include "apps/learn/learn.h"
+#include "apps/system/charging.h"
+#include "apps/system/pet.h"
+
+#include <M5Cardputer.h>
+#include <Preferences.h>
+#include <SD.h>
+#include <SPI.h>
+
+// =============================================================================
+// Menu definition — categorized
+// =============================================================================
+struct MenuItem { const char* label; const char* desc; AppState target; bool header; };
+
+static const MenuItem MENU[] = {
+    { "TOOLS",       "",                          AppState::HOME,         true  },
+    { " CSI Radar",  "Detect people via WiFi",    AppState::TOOL_CSI,     false },
+    { " My Pet",     "Virtual cyber-pet",         AppState::TOOL_PET,     false },
+
+    { "GAMES",       "",                          AppState::HOME,         true  },
+    { " Snake",      "Classic snake",             AppState::G_SNAKE,      false },
+    { " Tetris",     "Block stacker",             AppState::G_TETRIS,     false },
+    { " Wordle",     "5-letter guess",            AppState::G_WORDLE,     false },
+    { " Chess",      "2P or vs AI",               AppState::G_CHESS,      false },
+    { " Checkers",   "2P or vs AI",               AppState::G_CHECKERS,   false },
+    { " Tron",       "Light cycles 2P/AI",        AppState::G_TRON,       false },
+    { " Pong",       "2P or vs AI",               AppState::G_PONG,       false },
+    { " 2048",       "Slide & combine",           AppState::G_2048,       false },
+    { " Life",       "Conway's cells",            AppState::G_LIFE,       false },
+
+    { "OFF-GRID",    "",                          AppState::HOME,         true  },
+    { " Survival",   "Offline guide",             AppState::OG_SURVIVAL,  false },
+    { " Morse",      "Trainer & sender",          AppState::OG_MORSE,     false },
+    { " SOS Beacon", "Emergency signal",          AppState::OG_SOS,       false },
+    { " GPS",        "Needs CapLoRa module",      AppState::OG_GPS,       false },
+    { " LoRa Msg",   "Needs CapLoRa module",      AppState::OG_LORA,      false },
+    { " Compass",    "Needs CapLoRa module",      AppState::OG_COMPASS,   false },
+
+    { "EDC TOOLS",   "",                          AppState::HOME,         true  },
+    { " Clock",      "Time/stopwatch/timer",      AppState::EDC_CLOCK,    false },
+    { " Flashlight", "Light + SOS strobe",        AppState::EDC_FLASHLIGHT,false },
+    { " Dice/Coin",  "Roll & flip",               AppState::EDC_DICE,     false },
+    { " Notes",      "Save text to SD",           AppState::EDC_NOTES,    false },
+    { " Calculator", "Basic math",                AppState::EDC_CALC,     false },
+    { " Converter",  "Units",                     AppState::EDC_CONVERT,  false },
+
+    { "MEDIA",       "",                          AppState::HOME,         true  },
+    { " Music",      "WAV player",                AppState::MEDIA_MUSIC,  false },
+
+    { "LEARN",       "",                          AppState::HOME,         true  },
+    { " Hacking 101","Ethical hacking",           AppState::LEARN,        false },
+
+    { "SYSTEM",      "",                          AppState::HOME,         true  },
+    { " Settings",   "Theme/background",          AppState::SYS_SETTINGS, false },
+    { " Battery",    "Charging mode",             AppState::SYS_CHARGING, false },
+    { " Firmwares",  "Other firmware info",       AppState::SYS_FIRMWARES,false },
+    { " Device Info","Hardware/memory",           AppState::SYS_INFO,     false },
+};
+static constexpr int MENU_LEN = sizeof(MENU)/sizeof(MENU[0]);
+
+static int  g_cursor=1;
+static int  g_scroll=0;
+static bool g_sd_ok=false;
+static int  g_set_cursor=0;
+static int  g_screen_sel=0;
+
+static LGFX_Sprite* g_home_bg=nullptr;
+static bool g_home_bg_ready=false;
+
+// =============================================================================
+// Forward declarations
+// =============================================================================
+static void drawHome();
+static void renderHome(uint32_t now);
+static void drawSettings();
+static void handleSettings(char key);
+static void drawSysInfo();
+static void drawFirmwares();
+static int  g_fw_scroll=0;
+static void handleFirmwares(char key);
+static void drawSlotScreen(const char* title, const char* module);
+static void drawScreenSelect();
+static void handleScreenSelect(char key);
+static void enterSleep();
+
+// Persist helpers
+static void saveDualScreen(){ Preferences p;p.begin("purplx",false);p.putBool("dual",g_dual_screen);p.end(); }
+static bool loadDualWasSet(){ Preferences p;p.begin("purplx",true);bool s=p.isKey("dual");if(s)g_dual_screen=p.getBool("dual",true);p.end();return s; }
+
+// =============================================================================
+// Menu navigation (skip headers)
+// =============================================================================
+static int nextSel(int from,int dir){
+    int i=from;
+    for(int n=0;n<MENU_LEN;n++){
+        i+=dir; if(i<0)i=MENU_LEN-1; if(i>=MENU_LEN)i=0;
+        if(!MENU[i].header)return i;
+    }
+    return from;
+}
+
+// =============================================================================
+// OS_SetState
+// =============================================================================
+bool OS_SetState(AppState next){
+    // stop outgoing
+    switch(g_app_state){
+        case AppState::TOOL_CSI:      CSI::stop_scanning(); break;
+        case AppState::TOOL_PET:      Pet::stop(); break;
+        case AppState::G_SNAKE:       Games::Snake::stop(); break;
+        case AppState::G_TETRIS:      Games::Tetris::stop(); break;
+        case AppState::G_WORDLE:      Games::Wordle::stop(); break;
+        case AppState::G_CHESS:       Games::Chess::stop(); break;
+        case AppState::G_CHECKERS:    Games::Checkers::stop(); break;
+        case AppState::G_TRON:        Games::Tron::stop(); break;
+        case AppState::G_PONG:        Games::Pong::stop(); break;
+        case AppState::G_2048:        Games::G2048::stop(); break;
+        case AppState::G_LIFE:        Games::Life::stop(); break;
+        case AppState::OG_SURVIVAL:   OffGrid::Survival::stop(); break;
+        case AppState::OG_MORSE:      OffGrid::Morse::stop(); break;
+        case AppState::OG_SOS:        OffGrid::SOS::stop(); break;
+        case AppState::EDC_CLOCK:     EDC::Clock::stop(); break;
+        case AppState::EDC_FLASHLIGHT:EDC::Flashlight::stop(); break;
+        case AppState::EDC_DICE:      EDC::Dice::stop(); break;
+        case AppState::EDC_NOTES:     EDC::Notes::stop(); break;
+        case AppState::EDC_CALC:      EDC::Calc::stop(); break;
+        case AppState::EDC_CONVERT:   EDC::Convert::stop(); break;
+        case AppState::MEDIA_MUSIC:   Music::stop(); break;
+        case AppState::LEARN:         Learn::stop(); break;
+        case AppState::SYS_CHARGING:  Charging::stop(); break;
+        default: break;
+    }
+
+    g_app_state=next;
+
+    // start incoming
+    switch(next){
+        case AppState::HOME:          drawHome(); break;
+        case AppState::TOOL_CSI:      CSI::start_scanning(); break;
+        case AppState::TOOL_PET:      Pet::start(); break;
+        case AppState::G_SNAKE:       Games::Snake::start(); break;
+        case AppState::G_TETRIS:      Games::Tetris::start(); break;
+        case AppState::G_WORDLE:      Games::Wordle::start(); break;
+        case AppState::G_CHESS:       Games::Chess::start(); break;
+        case AppState::G_CHECKERS:    Games::Checkers::start(); break;
+        case AppState::G_TRON:        Games::Tron::start(); break;
+        case AppState::G_PONG:        Games::Pong::start(); break;
+        case AppState::G_2048:        Games::G2048::start(); break;
+        case AppState::G_LIFE:        Games::Life::start(); break;
+        case AppState::OG_SURVIVAL:   OffGrid::Survival::start(); break;
+        case AppState::OG_MORSE:      OffGrid::Morse::start(); break;
+        case AppState::OG_SOS:        OffGrid::SOS::start(); break;
+        case AppState::OG_GPS:        drawSlotScreen("GPS","CapLoRa SX1262 / ATGM336H"); break;
+        case AppState::OG_LORA:       drawSlotScreen("LoRa Messenger","CapLoRa SX1262"); break;
+        case AppState::OG_COMPASS:    drawSlotScreen("Compass","CapLoRa GPS module"); break;
+        case AppState::EDC_CLOCK:     EDC::Clock::start(); break;
+        case AppState::EDC_FLASHLIGHT:EDC::Flashlight::start(); break;
+        case AppState::EDC_DICE:      EDC::Dice::start(); break;
+        case AppState::EDC_NOTES:     EDC::Notes::start(); break;
+        case AppState::EDC_CALC:      EDC::Calc::start(); break;
+        case AppState::EDC_CONVERT:   EDC::Convert::start(); break;
+        case AppState::MEDIA_MUSIC:   Music::start(); break;
+        case AppState::LEARN:         Learn::start(); break;
+        case AppState::SYS_SETTINGS:  g_set_cursor=0; drawSettings(); break;
+        case AppState::SYS_CHARGING:  Charging::start(); break;
+        case AppState::SYS_FIRMWARES: g_fw_scroll=0; drawFirmwares(); break;
+        case AppState::SYS_INFO:      drawSysInfo(); break;
+        case AppState::SCREEN_SELECT: g_screen_sel=0; drawScreenSelect(); break;
+        default: break;
+    }
+    return true;
+}
+
+// =============================================================================
+// Boot splash — "Purplx" over matrix rain
+// =============================================================================
+static void bootSplash(){
+    const ColorTheme* t=g_theme;
+    LGFX_Sprite spr(&g_lcd_secondary);
+    spr.setPsram(true);
+    if(!spr.createSprite(320,240)){
+        g_lcd_secondary.fillScreen(TFT_BLACK);
+        g_lcd_secondary.setTextSize(5);
+        g_lcd_secondary.setTextColor(t->primary);
+        g_lcd_secondary.setCursor(40,100);
+        g_lcd_secondary.print("PURPLX");
+        delay(1500);
+        return;
+    }
+    CyberFX::begin(CyberFX::Effect::MATRIX,320,240);
+    for(int f=0;f<55;f++){
+        spr.fillSprite(TFT_BLACK);
+        CyberFX::draw(spr,millis(),0.85f);
+        spr.setTextSize(6);
+        if(f>28) spr.setTextColor(t->primary);
+        else { uint8_t a=(uint8_t)(f*9); spr.setTextColor(((a>>3)<<11)|((a>>2)<<5)|(a>>3)); }
+        spr.setCursor(34,90);
+        spr.print("PURPLX");
+        if(f>34){
+            spr.setTextSize(1);
+            spr.setTextColor(t->secondary);
+            spr.setCursor(96,150);
+            spr.print("ADV  CYBERDECK");
+        }
+        if(f>44){
+            spr.setTextColor(t->text_dim);
+            spr.setCursor(120,170);
+            spr.print("online");
+        }
+        spr.pushSprite(0,0);
+        delay(30);
+    }
+    spr.deleteSprite();
+
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(3);g_lcd_primary.setCursor(8,20);
+    g_lcd_primary.print("PURPLX");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->text_dim,t->hud_bg);
+    g_lcd_primary.setCursor(8,58);g_lcd_primary.print("booting...");
+    delay(300);
+}
+
+// =============================================================================
+// HOME
+// =============================================================================
+static void drawHome(){
+    const ColorTheme* t=g_theme;
+    if(!g_home_bg_ready){
+        g_home_bg=new LGFX_Sprite(&g_lcd_secondary);
+        g_home_bg->setPsram(true);
+        if(g_home_bg->createSprite(320,240)){
+            g_home_bg_ready=true;
+            CyberFX::begin(CyberFX::Effect::MATRIX,320,240);
+        }
+    }
+    // primary HUD
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(4,6);
+    g_lcd_primary.print("PURPLX");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->secondary,t->hud_bg);
+    g_lcd_primary.setCursor(4,30);g_lcd_primary.print("ADV Monitor v" PURPLX_VERSION);
+    g_lcd_primary.setTextColor(t->text,t->hud_bg);
+    g_lcd_primary.setCursor(4,48);g_lcd_primary.printf("Heap %uKB",ESP.getFreeHeap()/1024);
+    g_lcd_primary.setCursor(4,60);
+    g_lcd_primary.setTextColor(g_sd_ok?t->success:t->alert,t->hud_bg);
+    g_lcd_primary.print(g_sd_ok?"SD OK":"No SD");
+    g_lcd_primary.setTextColor(t->text_dim,t->hud_bg);
+    g_lcd_primary.setCursor(4,80);g_lcd_primary.print("W/S move ENTER pick");
+    g_lcd_primary.setCursor(4,92);g_lcd_primary.print("T theme B bg N night");
+}
+
+static void renderHome(uint32_t now){
+    if(!g_home_bg_ready)return;
+    const ColorTheme* t=g_theme;
+    g_home_bg->fillSprite(t->bg);
+    CyberFX::draw(*g_home_bg,now,0.5f);
+
+    // title bar
+    g_home_bg->fillRect(0,0,320,22,t->title_bg);
+    g_home_bg->drawFastHLine(0,21,320,t->border);
+    g_home_bg->setTextSize(1);
+    g_home_bg->setTextColor(t->primary,t->title_bg);
+    g_home_bg->setCursor(8,7);g_home_bg->print("P U R P L X");
+    g_home_bg->setTextColor(t->secondary,t->title_bg);
+    char badge[14];snprintf(badge,sizeof(badge),"[%s]",t->name);
+    g_home_bg->setCursor(318-g_home_bg->textWidth(badge),7);
+    g_home_bg->print(badge);
+
+    // ensure cursor visible (scroll window)
+    const int rowH=14, visRows=14;
+    if(g_cursor < g_scroll+2) g_scroll = (g_cursor>=2)?g_cursor-2:0;
+    if(g_cursor > g_scroll+visRows-2) g_scroll = g_cursor-visRows+2;
+    if(g_scroll<0)g_scroll=0;
+    if(g_scroll>MENU_LEN-visRows)g_scroll=(MENU_LEN>visRows)?MENU_LEN-visRows:0;
+
+    int y=26;
+    for(int i=g_scroll;i<MENU_LEN && i<g_scroll+visRows;i++){
+        if(MENU[i].header){
+            g_home_bg->setTextColor(t->secondary,t->bg);
+            g_home_bg->setCursor(6,y+2);g_home_bg->print(MENU[i].label);
+            g_home_bg->drawFastHLine(6,y+11,70,t->border);
+        } else {
+            bool sel=(i==g_cursor);
+            if(sel){
+                g_home_bg->fillRect(2,y-1,316,rowH,t->highlight_bg);
+                g_home_bg->setTextColor(t->highlight_text,t->highlight_bg);
+                g_home_bg->setCursor(6,y+2);g_home_bg->print(">");
+            } else {
+                g_home_bg->setTextColor(t->text,t->bg);
+                g_home_bg->setCursor(6,y+2);g_home_bg->print(" ");
+            }
+            g_home_bg->setCursor(18,y+2);g_home_bg->print(MENU[i].label);
+            g_home_bg->setTextColor(sel?t->highlight_text:t->text_dim,sel?t->highlight_bg:t->bg);
+            g_home_bg->setCursor(160,y+2);g_home_bg->print(MENU[i].desc);
+        }
+        y+=rowH;
+    }
+
+    // footer
+    g_home_bg->fillRect(0,226,320,14,t->title_bg);
+    g_home_bg->setTextColor(t->text_dim,t->title_bg);
+    g_home_bg->setCursor(6,229);
+    g_home_bg->print("[W/S]move [ENTER]open [T]heme [N]ight [?]help");
+
+    if(xSemaphoreTake(g_display_mutex,pdMS_TO_TICKS(15))==pdTRUE){
+        g_home_bg->pushSprite(0,0);
+        xSemaphoreGive(g_display_mutex);
+    }
+}
+
+// =============================================================================
+// SETTINGS
+// =============================================================================
+static void drawSettings(){
+    const ColorTheme* t=g_theme;
+    g_lcd_secondary.fillScreen(t->bg);
+    g_lcd_secondary.fillRect(0,0,320,24,t->title_bg);
+    g_lcd_secondary.drawFastHLine(0,23,320,t->border);
+    g_lcd_secondary.setTextSize(1);
+    g_lcd_secondary.setTextColor(t->primary,t->title_bg);
+    g_lcd_secondary.setCursor(8,8);g_lcd_secondary.print("SETTINGS");
+
+    struct Row{const char* l;const char* d;};
+    static const Row R[]={
+        {"Theme","Color scheme (8)"},
+        {"Background","Home animation"},
+        {"CSI Channel","WiFi ch for radar"},
+        {"CSI Sensitivity","Motion threshold"},
+        {"Sleep Now","Low-power deep sleep"},
+    };
+    static const int RC=5;
+    char v[5][20];
+    snprintf(v[0],20,"%s",g_theme->name);
+    snprintf(v[1],20,"%s",CyberFX::name());
+    snprintf(v[2],20,"CH %d",CSI::g_config.fixed_channel);
+    snprintf(v[3],20,"%d%%",(int)(CSI::g_config.motion_threshold*100));
+    snprintf(v[4],20,"press ,");
+
+    for(int i=0;i<RC;i++){
+        int y=30+i*30;bool s=(i==g_set_cursor);
+        if(s){g_lcd_secondary.fillRect(0,y,320,28,t->highlight_bg);
+              g_lcd_secondary.setTextColor(t->highlight_text,t->highlight_bg);}
+        else{g_lcd_secondary.fillRect(0,y,320,28,(i%2)?t->row_b:t->row_a);
+             g_lcd_secondary.setTextColor(t->text,(i%2)?t->row_b:t->row_a);}
+        g_lcd_secondary.setCursor(6,y+4);g_lcd_secondary.print(s?">":" ");
+        g_lcd_secondary.setCursor(16,y+4);g_lcd_secondary.print(R[i].l);
+        g_lcd_secondary.setTextColor(s?t->highlight_text:t->text_dim,s?t->highlight_bg:((i%2)?t->row_b:t->row_a));
+        g_lcd_secondary.setCursor(16,y+15);g_lcd_secondary.print(R[i].d);
+        g_lcd_secondary.setTextColor(s?t->highlight_text:t->secondary,s?t->highlight_bg:((i%2)?t->row_b:t->row_a));
+        int vw=g_lcd_secondary.textWidth(v[i]);
+        g_lcd_secondary.setCursor(312-vw,y+9);g_lcd_secondary.print(v[i]);
+    }
+    // theme swatches
+    for(int i=0;i<(int)ThemeID::COUNT;i++){
+        int sw=320/(int)ThemeID::COUNT;bool a=(i==(int)g_theme_id);
+        g_lcd_secondary.fillRect(i*sw,232,sw,8,a?TFT_WHITE:THEMES[i]->primary);
+    }
+    g_lcd_secondary.fillRect(0,222,320,10,t->title_bg);
+    g_lcd_secondary.setTextColor(t->text_dim,t->title_bg);
+    g_lcd_secondary.setCursor(6,223);g_lcd_secondary.print("[W/S]pick [,][/]change [ESC]back");
+
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(4,6);g_lcd_primary.print("CONFIG");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->text_dim,t->hud_bg);
+    g_lcd_primary.setCursor(4,34);g_lcd_primary.print("Saves instantly");
+}
+
+static void handleSettings(char key){
+    static const int RC=5;
+    if(key=='w'||key=='W'){if(g_set_cursor>0)g_set_cursor--;drawSettings();}
+    else if(key=='s'||key=='S'){if(g_set_cursor<RC-1)g_set_cursor++;drawSettings();}
+    else if(key==','||key=='/'){
+        bool inc=(key=='/');
+        switch(g_set_cursor){
+            case 0: inc?Themes::next():Themes::prev(); drawSettings(); break;
+            case 1: CyberFX::next(320,240); drawSettings(); break;
+            case 2:
+                if(inc){if(CSI::g_config.fixed_channel<13)CSI::g_config.fixed_channel++;}
+                else{if(CSI::g_config.fixed_channel>1)CSI::g_config.fixed_channel--;}
+                drawSettings(); break;
+            case 3:
+                if(inc){if(CSI::g_config.motion_threshold<0.9f)CSI::g_config.motion_threshold+=0.05f;}
+                else{if(CSI::g_config.motion_threshold>0.1f)CSI::g_config.motion_threshold-=0.05f;}
+                drawSettings(); break;
+            case 4: enterSleep(); break;
+        }
+    }
+}
+
+// =============================================================================
+// SYSINFO
+// =============================================================================
+static void drawSysInfo(){
+    const ColorTheme* t=g_theme;
+    g_lcd_secondary.fillScreen(t->bg);
+    g_lcd_secondary.fillRect(0,0,320,24,t->title_bg);
+    g_lcd_secondary.drawFastHLine(0,23,320,t->border);
+    g_lcd_secondary.setTextSize(1);
+    g_lcd_secondary.setTextColor(t->primary,t->title_bg);
+    g_lcd_secondary.setCursor(8,8);g_lcd_secondary.print("DEVICE INFO");
+
+    int y=34;
+    auto row=[&](const char* k,const char* val){
+        g_lcd_secondary.setTextColor(t->text_dim,t->bg);
+        g_lcd_secondary.setCursor(12,y);g_lcd_secondary.print(k);
+        g_lcd_secondary.setTextColor(t->text,t->bg);
+        g_lcd_secondary.setCursor(150,y);g_lcd_secondary.print(val);
+        y+=17;
+    };
+    char b[32];
+    row("Device","Cardputer ADV");
+    row("Chip","ESP32-S3");
+    snprintf(b,sizeof(b),"%u MHz",ESP.getCpuFreqMHz());row("CPU",b);
+    snprintf(b,sizeof(b),"%u MB",ESP.getFlashChipSize()/(1024*1024));row("Flash",b);
+    snprintf(b,sizeof(b),"%u MB",ESP.getPsramSize()/(1024*1024));row("PSRAM",b);
+    snprintf(b,sizeof(b),"%u KB",ESP.getFreeHeap()/1024);row("Free Heap",b);
+    snprintf(b,sizeof(b),"%u KB",ESP.getFreePsram()/1024);row("Free PSRAM",b);
+    row("Screens", g_dual_screen?"Dual (ST7789+ILI)":"Single (ST7789)");
+    row("SD Card", g_sd_ok?"Mounted":"Not found");
+    snprintf(b,sizeof(b),"v%s",PURPLX_VERSION);row("Firmware",b);
+
+    g_lcd_secondary.fillRect(0,224,320,16,t->title_bg);
+    g_lcd_secondary.setTextColor(t->text_dim,t->title_bg);
+    g_lcd_secondary.setCursor(6,228);g_lcd_secondary.print("[ESC] back");
+
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(4,6);g_lcd_primary.print("SYSTEM");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->success,t->hud_bg);
+    g_lcd_primary.setCursor(4,34);g_lcd_primary.print("All nominal");
+}
+
+// =============================================================================
+// FIRMWARES info screen
+// =============================================================================
+static const char* FW_LINES[] = {
+    "Purplx is your cyberdeck home base.",
+    "For WiFi/BLE/RF attack tools, flash a",
+    "dedicated firmware via M5Burner, then",
+    "re-flash Purplx to come back.",
+    "",
+    "RECOMMENDED:",
+    "",
+    "Evil-Cardputer",
+    "  Portals, deauth, BLE, recon",
+    "  github 7h30th3r0n3/Evil-M5Project",
+    "",
+    "Bruce (DualScreen fork)",
+    "  Full toolkit, keeps 2nd screen",
+    "  github CreeperRick / skizzophrenic",
+    "",
+    "GhostESP",
+    "  WiFi/BLE toolkit (single screen)",
+    "  github jaylikesbunda/Ghost_ESP",
+    "",
+    "HOW TO SWITCH:",
+    "1. Install M5Burner on a computer",
+    "2. Connect Cardputer via USB-C",
+    "3. Search firmware name, click Burn",
+    "4. To return: re-burn Purplx",
+    "",
+    "Or use M5Launcher to hold several",
+    "firmwares on SD and switch with no PC.",
+    "",
+    "REMINDER: only test your own networks",
+    "and devices. Stay legal. Stay ethical.",
+};
+static const int FW_N=sizeof(FW_LINES)/sizeof(FW_LINES[0]);
+
+static void drawFirmwares(){
+    const ColorTheme* t=g_theme;
+    const int VIS=13;
+    g_lcd_secondary.fillScreen(t->bg);
+    g_lcd_secondary.fillRect(0,0,320,24,t->title_bg);
+    g_lcd_secondary.drawFastHLine(0,23,320,t->border);
+    g_lcd_secondary.setTextSize(1);
+    g_lcd_secondary.setTextColor(t->primary,t->title_bg);
+    g_lcd_secondary.setCursor(8,8);g_lcd_secondary.print("OTHER FIRMWARES");
+    char pos[12];snprintf(pos,sizeof(pos),"%d/%d",g_fw_scroll+1,FW_N);
+    g_lcd_secondary.setTextColor(t->secondary,t->title_bg);
+    g_lcd_secondary.setCursor(318-g_lcd_secondary.textWidth(pos),8);
+    g_lcd_secondary.print(pos);
+
+    int y=30;
+    for(int i=0;i<VIS;i++){
+        int li=g_fw_scroll+i;if(li>=FW_N)break;
+        const char* line=FW_LINES[li];
+        int len=strlen(line);
+        bool hdr=(len>2&&line[len-1]==':');
+        bool name=(len>2&&line[0]>='A'&&line[0]<='Z'&&line[1]>='a'&&line[1]<='z'&&strstr(line,"  ")==nullptr&&!hdr);
+        g_lcd_secondary.setTextColor(hdr?t->secondary:(name?t->primary:t->text),t->bg);
+        g_lcd_secondary.setCursor(8,y);g_lcd_secondary.print(line);
+        y+=14;
+    }
+    g_lcd_secondary.fillRect(0,224,320,16,t->title_bg);
+    g_lcd_secondary.setTextColor(t->text_dim,t->title_bg);
+    g_lcd_secondary.setCursor(6,228);g_lcd_secondary.print("[W/S] scroll   [ESC] back");
+
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(4,6);g_lcd_primary.print("FW");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->text_dim,t->hud_bg);
+    g_lcd_primary.setCursor(4,34);g_lcd_primary.print("Use M5Burner");
+}
+static void handleFirmwares(char key){
+    const int VIS=13;int maxS=(FW_N>VIS)?(FW_N-VIS):0;
+    if(key=='s'||key=='S'){if(g_fw_scroll<maxS)g_fw_scroll++;drawFirmwares();}
+    else if(key=='w'||key=='W'){if(g_fw_scroll>0)g_fw_scroll--;drawFirmwares();}
+}
+
+// =============================================================================
+// SLOT screen (GPS/LoRa/Compass coming soon)
+// =============================================================================
+static void drawSlotScreen(const char* title,const char* module){
+    const ColorTheme* t=g_theme;
+    g_lcd_secondary.fillScreen(t->bg);
+    g_lcd_secondary.fillRect(0,0,320,24,t->title_bg);
+    g_lcd_secondary.drawFastHLine(0,23,320,t->border);
+    g_lcd_secondary.setTextSize(1);
+    g_lcd_secondary.setTextColor(t->primary,t->title_bg);
+    g_lcd_secondary.setCursor(8,8);g_lcd_secondary.print(title);
+
+    g_lcd_secondary.setTextSize(2);
+    g_lcd_secondary.setTextColor(t->secondary,t->bg);
+    g_lcd_secondary.setCursor(60,70);g_lcd_secondary.print("COMING SOON");
+
+    g_lcd_secondary.setTextSize(1);
+    g_lcd_secondary.setTextColor(t->text,t->bg);
+    g_lcd_secondary.setCursor(40,110);g_lcd_secondary.print("This feature needs:");
+    g_lcd_secondary.setTextColor(t->primary,t->bg);
+    g_lcd_secondary.setCursor(40,128);g_lcd_secondary.print(module);
+    g_lcd_secondary.setTextColor(t->text_dim,t->bg);
+    g_lcd_secondary.setCursor(40,150);g_lcd_secondary.print("Plug in the module, and a future");
+    g_lcd_secondary.setCursor(40,162);g_lcd_secondary.print("Purplx update will enable it.");
+
+    g_lcd_secondary.fillRect(0,224,320,16,t->title_bg);
+    g_lcd_secondary.setTextColor(t->text_dim,t->title_bg);
+    g_lcd_secondary.setCursor(6,228);g_lcd_secondary.print("[ESC] back to home");
+
+    g_lcd_primary.fillScreen(t->hud_bg);
+    g_lcd_primary.setTextColor(t->primary,t->hud_bg);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(4,6);g_lcd_primary.print(title);
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->text_dim,t->hud_bg);
+    g_lcd_primary.setCursor(4,40);g_lcd_primary.print("Needs hardware");
+}
+
+// =============================================================================
+// SCREEN SELECT (first boot)
+// =============================================================================
+static void drawScreenSelect(){
+    const ColorTheme* t=g_theme;
+    g_lcd_primary.fillScreen(t->bg);
+    g_lcd_primary.setTextColor(t->primary,t->bg);
+    g_lcd_primary.setTextSize(1);
+    g_lcd_primary.setCursor(4,6);g_lcd_primary.print("SCREEN SETUP");
+    g_lcd_primary.setTextColor(t->text,t->bg);
+    g_lcd_primary.setCursor(4,22);g_lcd_primary.print("Do you have the 2nd");
+    g_lcd_primary.setCursor(4,32);g_lcd_primary.print("(ILI9341) screen?");
+    const char* o[2]={"YES - Dual screen","NO - Internal only"};
+    for(int i=0;i<2;i++){
+        int y=52+i*22;bool s=(i==g_screen_sel);
+        if(s){g_lcd_primary.fillRect(2,y,236,18,t->highlight_bg);
+              g_lcd_primary.setTextColor(t->highlight_text,t->highlight_bg);}
+        else g_lcd_primary.setTextColor(t->text,t->bg);
+        g_lcd_primary.setCursor(8,y+5);g_lcd_primary.print(s?">":" ");
+        g_lcd_primary.setCursor(20,y+5);g_lcd_primary.print(o[i]);
+    }
+    g_lcd_primary.setTextColor(t->text_dim,t->bg);
+    g_lcd_primary.setCursor(4,104);g_lcd_primary.print("W/S choose ENTER ok");
+
+    if(g_screen_sel==0){
+        g_lcd_secondary.fillScreen(t->bg);
+        g_lcd_secondary.setTextSize(2);
+        g_lcd_secondary.setTextColor(t->success,t->bg);
+        g_lcd_secondary.setCursor(40,90);g_lcd_secondary.print("If you can read");
+        g_lcd_secondary.setCursor(40,115);g_lcd_secondary.print("THIS, pick YES!");
+    }
+}
+static void handleScreenSelect(char key){
+    Serial.printf("[SCREEN_SELECT] key=0x%02x ('%c')\n", (int)key, (key>=32&&key<127)?key:'.');
+    if(key=='w'||key=='W'||key=='s'||key=='S'){
+        g_screen_sel=1-g_screen_sel; drawScreenSelect();
+    }
+    else if(key=='\n'||key=='\r' || key==' '){
+        g_dual_screen=(g_screen_sel==0);
+        saveDualScreen();
+        OS_SetState(AppState::HOME);
+    }
+    else if(key=='y'||key=='Y'){
+        g_dual_screen=true; saveDualScreen(); OS_SetState(AppState::HOME);
+    }
+    else if(key=='n'||key=='N'){
+        g_dual_screen=false; saveDualScreen(); OS_SetState(AppState::HOME);
+    }
+}
+
+// =============================================================================
+// SLEEP
+// =============================================================================
+static void enterSleep(){
+    const ColorTheme* t=g_theme;
+    g_lcd_secondary.fillScreen(TFT_BLACK);
+    g_lcd_primary.fillScreen(TFT_BLACK);
+    g_lcd_primary.setTextColor(t->primary,TFT_BLACK);
+    g_lcd_primary.setTextSize(2);g_lcd_primary.setCursor(10,40);
+    g_lcd_primary.print("SLEEPING");
+    g_lcd_primary.setTextSize(1);g_lcd_primary.setTextColor(t->text_dim,TFT_BLACK);
+    g_lcd_primary.setCursor(10,70);g_lcd_primary.print("Press side button");
+    g_lcd_primary.setCursor(10,82);g_lcd_primary.print("to wake");
+    delay(1500);
+    g_lcd_primary.setBrightness(0);
+    g_lcd_secondary.setBrightness(0);
+    // Wake on G0 button (GPIO0) — held LOW when pressed
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)0, 0);
+    esp_deep_sleep_start();
+}
+
+// =============================================================================
+// setup()
+// =============================================================================
+void setup(){
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("BOOT0");
+    Serial.println("\n\n=== Purplx v" PURPLX_VERSION " ===");
+    Serial.println("BOOT1");
+
+    Themes::begin();
+    Serial.println("BOOT2");
+
+    auto cfg=M5.config();
+    cfg.fallback_board = m5::board_t::board_M5CardputerADV;
+    cfg.clear_display = false;
+    Serial.println("BOOT3");
+    M5Cardputer.begin(cfg);
+    Serial.println("BOOT4");
+    OS::Keyboard_begin();
+    Serial.println("BOOT5");
+
+    if(!Display::init()){
+        Serial.println("[FATAL] display init failed");
+        while(true)vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    Serial.println("BOOT6");
+    bootSplash();
+    Serial.println("BOOT7");
+
+    g_sd_ok=OS::SD_init();
+    if(g_sd_ok)OS::SD_ensureDirectories();
+    Serial.printf("[SD] %s\n",g_sd_ok?"OK":"none");
+
+    Pet::boot_load();   // age the pet in background
+
+    if(!loadDualWasSet()){
+        g_app_state=AppState::SCREEN_SELECT;
+        g_screen_sel=0;
+        drawScreenSelect();
+    } else {
+        g_app_state=AppState::HOME;
+        g_cursor=1;
+        drawHome();
+    }
+    Serial.println("[Boot] ready");
+}
+
+// =============================================================================
+// loop()
+// =============================================================================
+void loop(){
+    OS::KeyEvent key;
+    const uint32_t now=millis();
+
+    if(OS::Keyboard_poll(key) && key.pressed){
+        AppState s=g_app_state;
+
+        // Global theme/night/background keys (work in most screens)
+        bool globalHandled=false;
+        if(s==AppState::HOME){
+            if(key.key=='w'||key.key=='W'){g_cursor=nextSel(g_cursor,-1);globalHandled=true;}
+            else if(key.key=='s'||key.key=='S'){g_cursor=nextSel(g_cursor,1);globalHandled=true;}
+            else if(key.key=='\n'||key.key=='\r'){if(!MENU[g_cursor].header)OS_SetState(MENU[g_cursor].target);globalHandled=true;}
+            else if(key.key=='t'||key.key=='T'){Themes::next();drawHome();globalHandled=true;}
+            else if(key.key=='b'||key.key=='B'){CyberFX::next(320,240);globalHandled=true;}
+            else if(key.key=='n'||key.key=='N'){Themes::set(ThemeID::NIGHT);drawHome();globalHandled=true;}
+        }
+        if(globalHandled){ /* done */ }
+        else {
+            switch(s){
+                case AppState::SCREEN_SELECT: handleScreenSelect(key.key); break;
+                case AppState::SYS_SETTINGS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else handleSettings(key.key);
+                    break;
+                case AppState::SYS_FIRMWARES:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else handleFirmwares(key.key);
+                    break;
+                case AppState::SYS_INFO:
+                case AppState::OG_GPS: case AppState::OG_LORA: case AppState::OG_COMPASS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    break;
+
+                // Games / apps that self-handle, ESC exits
+                case AppState::TOOL_CSI:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else if(key.key=='s'||key.key=='S'){float t=CSI::g_config.motion_threshold; CSI::g_config.motion_threshold=(t>0.38f)?0.18f:(t>0.24f)?0.45f:0.30f;}
+                    break;
+                case AppState::TOOL_PET:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Pet::handleKey(key.key); break;
+                case AppState::G_SNAKE:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Snake::handleKey(key.key); break;
+                case AppState::G_TETRIS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Tetris::handleKey(key.key); break;
+                case AppState::G_WORDLE:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Wordle::handleKey(key.key); break;
+                case AppState::G_CHESS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Chess::handleKey(key.key); break;
+                case AppState::G_CHECKERS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Checkers::handleKey(key.key); break;
+                case AppState::G_TRON:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Tron::handleKey(key.key); break;
+                case AppState::G_PONG:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Pong::handleKey(key.key); break;
+                case AppState::G_2048:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::G2048::handleKey(key.key); break;
+                case AppState::G_LIFE:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Games::Life::handleKey(key.key); break;
+                case AppState::OG_SURVIVAL:
+                    if((key.key==27||key.key=='`')&&OffGrid::Survival::atIndex())OS_SetState(AppState::HOME);
+                    else OffGrid::Survival::handleKey(key.key); break;
+                case AppState::OG_MORSE:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else OffGrid::Morse::handleKey(key.key); break;
+                case AppState::OG_SOS:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else OffGrid::SOS::handleKey(key.key); break;
+                case AppState::EDC_CLOCK:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Clock::handleKey(key.key); break;
+                case AppState::EDC_FLASHLIGHT:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Flashlight::handleKey(key.key); break;
+                case AppState::EDC_DICE:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Dice::handleKey(key.key); break;
+                case AppState::EDC_NOTES:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Notes::handleKey(key.key); break;
+                case AppState::EDC_CALC:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Calc::handleKey(key.key); break;
+                case AppState::EDC_CONVERT:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else EDC::Convert::handleKey(key.key); break;
+                case AppState::MEDIA_MUSIC:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    else Music::handleKey(key.key); break;
+                case AppState::LEARN:
+                    if((key.key==27||key.key=='`')&&Learn::atIndex())OS_SetState(AppState::HOME);
+                    else Learn::handleKey(key.key); break;
+                case AppState::SYS_CHARGING:
+                    if(key.key==27||key.key=='`')OS_SetState(AppState::HOME);
+                    break;
+                default: break;
+            }
+        }
+    }
+
+    // ── Per-frame render / tick ───────────────────────────────────────────────
+    switch(g_app_state){
+        case AppState::HOME: renderHome(now); break;
+        case AppState::TOOL_CSI:
+            CSI::render_waterfall(g_lcd_secondary);
+            CSI::render_hud(g_lcd_primary);
+            break;
+        case AppState::TOOL_PET:       Pet::tick(now); break;
+        case AppState::G_SNAKE:        Games::Snake::tick(now); break;
+        case AppState::G_TETRIS:       Games::Tetris::tick(now); break;
+        case AppState::G_TRON:         Games::Tron::tick(now); break;
+        case AppState::G_PONG:         Games::Pong::tick(now); break;
+        case AppState::G_LIFE:         Games::Life::tick(now); break;
+        case AppState::OG_MORSE:       OffGrid::Morse::tick(now); break;
+        case AppState::OG_SOS:         OffGrid::SOS::tick(now); break;
+        case AppState::EDC_CLOCK:      EDC::Clock::tick(now); break;
+        case AppState::EDC_FLASHLIGHT: EDC::Flashlight::tick(now); break;
+        case AppState::MEDIA_MUSIC:    Music::tick(now); break;
+        case AppState::SYS_CHARGING:   Charging::tick(now); break;
+        default: break;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(16));
+}
+
+// =============================================================================
+// OS namespace
+// =============================================================================
+namespace OS {
+
+void Keyboard_begin(){ Serial.println("[KB] ready"); }
+
+bool Keyboard_poll(KeyEvent& out){
+    // Ensure Cardputer ADV keyboard state is updated (ADV BSP may require this)
+    M5Cardputer.update();
+    M5.update();
+    if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
+        auto st=M5Cardputer.Keyboard.keysState();
+        out.key = (!st.word.empty()) ? st.word[0] : 0;
+        out.shift=st.del; out.fn=st.fn; out.pressed=true;
+        if(out.key==0 && st.enter) out.key='\n';
+        if(out.key==0 && st.tab)   out.key='\t';
+        if(out.key==0 && st.del)   out.key=8;     // backspace
+        if(out.key==0 && st.space) out.key=' ';
+        // Arrow cluster -> WASD (every game/menu reads WASD; both now work)
+        if(out.key==';') out.key='w';   // up
+        if(out.key=='.') out.key='s';   // down
+        if(out.key==',') out.key='a';   // left
+        if(out.key=='/') out.key='d';   // right
+        return (out.key!=0);
+    }
+    return false;
+}
+
+static bool _sd_ready=false;
+bool SD_init(){
+    if(!SD.begin(PIN_SD_CS)){_sd_ready=false;return false;}
+    _sd_ready=true;return true;
+}
+bool SD_ready(){return _sd_ready;}
+void SD_ensureDirectories(){
+    static const char* D[]={"/purplx","/purplx/music","/purplx/games","/purplx/notes"};
+    for(const char* d:D)if(!SD.exists(d))SD.mkdir(d);
+}
+float getBatteryVoltage(){
+    if(PIN_BATTERY_ADC<0)return 3.85f;
+    return (analogRead(PIN_BATTERY_ADC)/4095.0f)*3.3f*2.0f;
+}
+void reboot(){ESP.restart();}
+void deepSleep(uint32_t ms){
+    if(ms>0)esp_sleep_enable_timer_wakeup((uint64_t)ms*1000ULL);
+    esp_deep_sleep_start();
+}
+
+} // namespace OS

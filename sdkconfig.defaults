@@ -1,0 +1,71 @@
+# =============================================================================
+# sdkconfig.defaults — MegaFirmware / ESP32-S3 Cardputer ADV
+# Merged into sdkconfig during 'pio run'. Only non-default overrides.
+#
+# Key differences vs M5PorkChop (which targets no-PSRAM original Cardputer):
+#   - PSRAM enabled and configured for 8MB OPI mode
+#   - CSI explicitly enabled (we need the CSI scanner module)
+#   - Coredump to flash (pairs with our coredump partition)
+#   - NimBLE internal RAM only (same as PorkChop — BT must not use PSRAM)
+# =============================================================================
+
+# ─── CPU ──────────────────────────────────────────────────────────────────────
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+
+# ─── PSRAM (board has no PSRAM) ────────────────────────────────────────────
+CONFIG_ESP32S3_SPIRAM_SUPPORT=n
+# CONFIG_SPIRAM_MODE_OCT is not set
+# CONFIG_SPIRAM_SPEED_80M is not set
+# CONFIG_SPIRAM_USE_MALLOC is not set
+# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL is not set
+# CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL is not set
+
+# ─── Wi-Fi ────────────────────────────────────────────────────────────────────
+# CSI requires this to be explicitly enabled
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+CONFIG_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+# WiFi task pinned to Core 0 (Protocol CPU) — app loop runs on Core 1
+# CSI callbacks fire from this WiFi task — confirmed pattern from PorkChop
+CONFIG_WIFI_TASK_CORE_ID=0
+
+# ─── Bluetooth / NimBLE ───────────────────────────────────────────────────────
+# CRITICAL: BLE must NOT use PSRAM — confirmed by M5PorkChop architecture
+# BLE deinit reclaims 20-30KB internal RAM when radio switches
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=1
+CONFIG_BT_NIMBLE_LOG_LEVEL_ERROR=y
+
+# ─── FreeRTOS ─────────────────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+# Trace facility needed for task inspector in DIAG mode
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# ─── Stack Sizes ──────────────────────────────────────────────────────────────
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ARDUINO_LOOP_STACK_SIZE=8192
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# ─── USB Console ──────────────────────────────────────────────────────────────
+CONFIG_ESP_CONSOLE_USB_CDC=y
+
+# ─── OTA Rollback — required for SD Firmware Launcher ────────────────────────
+# When enabled, any app partition that does not call
+# esp_ota_mark_app_valid_cancel_rollback() after booting is treated as
+# PENDING_VERIFY. On the next reset the bootloader marks it ABORTED and
+# falls back to the last confirmed partition (factory = Purplx).
+# Purplx calls mark_valid in setup() to keep itself as the known-good slot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ─── Coredump — UART output (no flash partition allocated) ───────────────────
+# On Guru Meditation: prints coredump to serial at 115200.
+# To capture: pio device monitor > coredump.txt, then press reset.
+CONFIG_ESP_COREDUMP_ENABLE=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_TO_UART=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
